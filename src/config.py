@@ -119,7 +119,7 @@ def generate_default_conf(path):
         ("DEFAULT_CONFIDENCE", None), ("DEFAULT_CLASSES", None),
         ("", None),
         ("# === Training Defaults ===", None),
-        ("EPOCHS", None), ("BATCH_SIZE", None), ("LEARNING_RATE", None),
+        ("EPOCHS", None), ("BATCH_SIZE", None), ("EARLY_STOPPING_PATIENCE", None), ("LEARNING_RATE", None),
         ("LR_FINAL", None), ("IMAGE_SIZE", None), ("FREEZE_LAYERS", None),
         ("", None),
         ("# === Device ===", None),
