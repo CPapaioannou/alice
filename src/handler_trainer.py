@@ -181,6 +181,7 @@ def _post_trainer_train(body: dict) -> tuple[int, str, bytes]:
     model_path = os.path.join(conf("MODELS_DIR"), model) if "/" not in model else model
     _epochs = int(body.get("epochs", conf("EPOCHS")))
     _batch = int(body.get("batch", conf("BATCH_SIZE")))
+    _patience = max(0, int(body.get("patience", conf("EARLY_STOPPING_PATIENCE"))))
     _lr = float(body.get("lr", conf("LEARNING_RATE")))
     _lrf = float(body.get("lrf", conf("LR_FINAL")))
     _imgsz = int(body.get("imgsz", conf("IMAGE_SIZE")))
@@ -190,7 +191,7 @@ def _post_trainer_train(body: dict) -> tuple[int, str, bytes]:
 
     def _run_train():
         with _trainer_dataset(_tds):
-            trainer_train(model_path, _epochs, _batch, _lr, _lrf, _imgsz, _freeze, _augment)
+            trainer_train(model_path, _epochs, _batch, _lr, _lrf, _imgsz, _freeze, _augment, _patience)
         with _state_lock:
             MODELS_LIST.clear(); MODELS_LIST.extend(scan_models())
 
@@ -302,6 +303,7 @@ def _post_trainer_pipeline_run(body: dict) -> tuple[int, str, bytes]:
                             model_path = student,
                             epochs     = int(params.get("trainEpochs", conf("EPOCHS"))),
                             batch_size = int(params.get("trainBatch", conf("BATCH_SIZE"))),
+                            patience   = max(0, int(params.get("trainPatience", conf("EARLY_STOPPING_PATIENCE")))),
                             lr         = float(params.get("trainLR", conf("LEARNING_RATE"))),
                             lr_final   = float(params.get("trainLRF", conf("LR_FINAL"))),
                             imgsz      = int(params.get("trainImgsz", conf("IMAGE_SIZE"))),
