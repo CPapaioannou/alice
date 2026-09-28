@@ -275,6 +275,7 @@
         <div class="flex-col gap-14">
           <div><div class="sec-label" data-tip="Number of training epochs.">Epochs</div><input type="number" class="num-inp w-full" id="s_EPOCHS" value="10" min="1" max="300"></div>
           <div><div class="sec-label" data-tip="Images per batch. Reduce if OOM.">Batch Size</div><input type="number" class="num-inp w-full" id="s_BATCH_SIZE" value="8" min="1" max="64"></div>
+          <div><div class="sec-label" data-tip="Stop if validation fitness does not improve for this many epochs. Set 0 to disable.">Early Stopping Patience</div><input type="number" class="num-inp w-full" id="s_EARLY_STOPPING_PATIENCE" value="15" min="0" max="300"></div>
           <div><div class="sec-label" data-tip="Initial learning rate.">Learning Rate</div><input type="number" class="num-inp w-full" id="s_LEARNING_RATE" value="0.0001" min="0.00001" max="0.1" step="0.0001"></div>
           <div><div class="sec-label" data-tip="Final LR as fraction of initial.">LR Final</div><input type="number" class="num-inp w-full" id="s_LR_FINAL" value="0.01" min="0.001" max="1" step="0.01"></div>
           <div><div class="sec-label" data-tip="Input resolution for training.">Image Size</div><input type="number" class="num-inp w-full" id="s_IMAGE_SIZE" value="640" min="320" max="1280" step="32"></div>
