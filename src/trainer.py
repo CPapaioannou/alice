@@ -651,7 +651,7 @@ def trainer_nms_cleanup(iou_threshold, dry_run=False):
     return {"ok": True, "modified": total_modified, "removed": total_removed}
 
 
-def trainer_train(model_path, epochs, batch_size, lr, lr_final, imgsz, freeze, augment=True):
+def trainer_train(model_path, epochs, batch_size, lr, lr_final, imgsz, freeze, augment=True, patience=15):
     """Fine-tune a YOLO model on the current dataset."""
     from ultralytics import YOLO
 
@@ -854,6 +854,7 @@ def trainer_train(model_path, epochs, batch_size, lr, lr_final, imgsz, freeze, a
                 lr0=lr,
                 lrf=lr_final,
                 warmup_epochs=1,
+                patience=max(0, int(patience)),
                 freeze=freeze,
                 project=output_dir,
                 name="finetune",

@@ -57,6 +57,7 @@ CONF_DEFAULTS = {
     # Training Defaults
     "EPOCHS": 10,
     "BATCH_SIZE": 8,
+    "EARLY_STOPPING_PATIENCE": 15,
     "LEARNING_RATE": 0.0001,
     "LR_FINAL": 0.01,
     "IMAGE_SIZE": 640,
