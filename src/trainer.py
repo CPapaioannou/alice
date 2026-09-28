@@ -685,7 +685,7 @@ def _read_training_metrics(results_csv):
     return max(rows, key=lambda r: r["mAP50_95"])
 
 
-def trainer_train(model_path, epochs, batch_size, lr, lr_final, imgsz, freeze, augment=True):
+def trainer_train(model_path, epochs, batch_size, lr, lr_final, imgsz, freeze, augment=True, patience=15):
     """Fine-tune a YOLO model on the current dataset."""
     from ultralytics import YOLO
 
@@ -888,6 +888,7 @@ def trainer_train(model_path, epochs, batch_size, lr, lr_final, imgsz, freeze, a
                 lr0=lr,
                 lrf=lr_final,
                 warmup_epochs=1,
+                patience=max(0, int(patience)),
                 freeze=freeze,
                 project=output_dir,
                 name="finetune",
