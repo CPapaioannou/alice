@@ -2,6 +2,7 @@
 # TRAINER FUNCTIONS
 # ============================================================
 
+import csv
 import glob
 import json
 import os
@@ -651,6 +652,39 @@ def trainer_nms_cleanup(iou_threshold, dry_run=False):
     return {"ok": True, "modified": total_modified, "removed": total_removed}
 
 
+def _read_training_metrics(results_csv):
+    """Read Ultralytics training metrics from results.csv.
+
+    Returns the row with the highest mAP50-95 (the metric Ultralytics uses for
+    model fitness/best checkpoint selection), or None if no valid rows exist.
+    """
+    if not os.path.exists(results_csv):
+        return None
+
+    try:
+        with open(results_csv, newline="") as f:
+            reader = csv.DictReader(f)
+            rows = []
+            for raw in reader:
+                row = {str(k).strip(): v for k, v in raw.items() if k is not None}
+                try:
+                    rows.append({
+                        "epoch": int(float(row.get("epoch", 0))),
+                        "precision": float(row.get("metrics/precision(B)", 0) or 0),
+                        "recall": float(row.get("metrics/recall(B)", 0) or 0),
+                        "mAP50": float(row.get("metrics/mAP50(B)", 0) or 0),
+                        "mAP50_95": float(row.get("metrics/mAP50-95(B)", 0) or 0),
+                    })
+                except (TypeError, ValueError):
+                    continue
+    except (OSError, csv.Error):
+        return None
+
+    if not rows:
+        return None
+    return max(rows, key=lambda r: r["mAP50_95"])
+
+
 def trainer_train(model_path, epochs, batch_size, lr, lr_final, imgsz, freeze, augment=True):
     """Fine-tune a YOLO model on the current dataset."""
     from ultralytics import YOLO
@@ -884,12 +918,30 @@ def trainer_train(model_path, epochs, batch_size, lr, lr_final, imgsz, freeze, a
         final_path = os.path.join(models_dir, f"{base_name}-finetuned.pt")
         shutil.copy2(best_pt, final_path)
         ep = _ss("train").get("epochs", [])
-        last_map = ep[-1].get("mAP50", 0) if ep else 0
+
+        # Prefer Ultralytics' authoritative results.csv over callback state.
+        # The callback API has changed between Ultralytics releases and may not
+        # expose validation metrics at on_fit_epoch_end, which previously caused
+        # successful runs to be reported as mAP50: 0.000.
+        results_csv = os.path.join(output_dir, "finetune", "results.csv")
+        metrics = _read_training_metrics(results_csv)
+        if metrics:
+            metric_text = (
+                f"mAP50: {metrics['mAP50']:.3f}, "
+                f"mAP50-95: {metrics['mAP50_95']:.3f}, "
+                f"P: {metrics['precision']:.3f}, R: {metrics['recall']:.3f}"
+            )
+        else:
+            last_map = ep[-1].get("mAP50", 0) if ep else 0
+            metrics = {"mAP50": last_map}
+            metric_text = f"mAP50: {last_map:.3f}"
+
+        result = {"ok": True, "output": final_path, "metrics": metrics}
         _ss_reset("train", running=False, progress=100, current=epochs, total=epochs,
-            message=f"Done: {final_path} (mAP50: {last_map:.3f})", epochs=ep,
-            result={"ok": True, "output": final_path})
-        _log(f"TRAIN: COMPLETED — {final_path} (mAP50: {last_map:.3f})")
-        return {"ok": True, "output": final_path}
+            message=f"Done: {final_path} ({metric_text})", epochs=ep,
+            result=result)
+        _log(f"TRAIN: COMPLETED — {final_path} ({metric_text})")
+        return result
     else:
         _ss_reset("train", running=False, progress=100, current=epochs, total=epochs,
             message="Error: best.pt not found", epochs=_ss("train").get("epochs", []),
