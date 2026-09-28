@@ -44,6 +44,9 @@ CONF_DEFAULTS = {
     "LIVE_DIR": "",
     "EXPORTS_DIR": "",
     "FRIGATE_DB": "",
+    "FRIGATE_DB_SSH_HOST": "",
+    "FRIGATE_DB_SSH_PORT": 0,
+    "FRIGATE_DB_SSH_IDENTITY": "",
     "VIDEO_EXTENSIONS": [".mp4", ".avi", ".mkv", ".mov"],
     # AI Defaults
     "DEFAULT_MODEL": "",
