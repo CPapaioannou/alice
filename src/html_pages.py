@@ -205,7 +205,10 @@
           <div><div class="sec-label" data-tip="Directory containing .pt model files.">Models Directory</div><input class="inp" id="s_MODELS_DIR" value=""></div>
           <div><div class="sec-label" data-tip="Frigate clips directory for Live mode.">Frigate Clips (Live)</div><input class="inp" id="s_LIVE_DIR" value=""></div>
           <div><div class="sec-label" data-tip="Frigate exports directory for Video mode.">Frigate Exports (Video)</div><input class="inp" id="s_EXPORTS_DIR" value=""></div>
-          <div><div class="sec-label" data-tip="Path to Frigate SQLite database.">Frigate DB</div><input class="inp" id="s_FRIGATE_DB" value=""></div>
+          <div><div class="sec-label" data-tip="Path to Frigate SQLite database. For SSH mode, this path is on the remote Frigate host.">Frigate DB</div><input class="inp" id="s_FRIGATE_DB" value=""></div>
+          <div><div class="sec-label" data-tip="Optional SSH destination (host, alias, or user@host). Leave empty to read the DB locally.">Frigate DB SSH Host</div><input class="inp" id="s_FRIGATE_DB_SSH_HOST" value="" placeholder="frigate-host"></div>
+          <div><div class="sec-label" data-tip="Optional SSH port. 0 uses the SSH client/config default.">Frigate DB SSH Port</div><input type="number" class="num-inp" id="s_FRIGATE_DB_SSH_PORT" value="0" min="0" max="65535" style="width:100%"></div>
+          <div><div class="sec-label" data-tip="Optional local path to an SSH private key. Leave empty to use ssh-agent or ~/.ssh/config.">Frigate DB SSH Identity</div><input class="inp" id="s_FRIGATE_DB_SSH_IDENTITY" value="" placeholder="~/.ssh/id_ed25519"></div>
         </div>
       </div>
       <div class="settings-card">

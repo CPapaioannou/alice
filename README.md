@@ -175,6 +175,36 @@ volumes:
 
 > **Important:** The `frigate.db` volume must point to the actual **file**, not a directory. If the file doesn't exist on the host at the time of container creation, Docker will create a directory instead and ALICE won't be able to open the database.
 
+
+### Remote Frigate database over SSH
+
+If ALICE and Frigate run on different machines, ALICE can query Frigate's SQLite
+database over SSH instead of mounting or copying the database. The SQLite process
+runs on the Frigate host, so SQLite sees the database, WAL, and shared-memory
+files on the same local filesystem.
+
+Configure:
+
+```ini
+FRIGATE_DB = /path/on/frigate-host/frigate.db
+FRIGATE_DB_SSH_HOST = frigate-host
+FRIGATE_DB_SSH_PORT = 0
+FRIGATE_DB_SSH_IDENTITY =
+```
+
+`FRIGATE_DB_SSH_HOST` may be an SSH host alias, hostname, or `user@host`.
+Leave it empty to use the existing local SQLite behaviour. Port `0` uses the
+SSH client/config default. The identity field is optional; leaving it empty uses
+the normal SSH agent and `~/.ssh/config` resolution.
+
+Remote access is intentionally non-interactive (`BatchMode=yes`) and the query
+opens SQLite with `-readonly`. The remote SSH account must have read access to
+the Frigate database and its active `-wal` / `-shm` files, and the remote host
+must provide the `sqlite3` command.
+
+For media, `LIVE_DIR` and `EXPORTS_DIR` can still point to read-only mounted
+paths such as SSHFS. Only the database query is executed remotely.
+
 Then start:
 
 ```bash

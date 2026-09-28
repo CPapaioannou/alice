@@ -6,8 +6,10 @@ import glob
 import json
 import os
 import random
+import shlex
 import shutil
 import sqlite3
+import subprocess
 from collections import defaultdict
 from pathlib import Path
 
@@ -47,6 +49,94 @@ def _ss_reset(step, **kwargs):
     s.update({"running": False, "progress": 0, "current": 0, "total": 0, "message": "", "epochs": []})
     s.update(kwargs)
 
+FRIGATE_EVENT_QUERY = "SELECT id, camera FROM event WHERE has_snapshot = 1 ORDER BY start_time DESC"
+
+
+def _frigate_event_rows():
+    """Return Frigate event rows from a local SQLite DB or over SSH.
+
+    When FRIGATE_DB_SSH_HOST is configured, the SQLite query executes on the
+    Frigate host so WAL/SHM handling stays local to that filesystem. SSH auth is
+    delegated to the user's normal SSH configuration/agent/key files.
+    """
+    frigate_db = str(conf("FRIGATE_DB") or "").strip()
+    ssh_host = str(conf("FRIGATE_DB_SSH_HOST") or "").strip()
+
+    if not frigate_db:
+        raise RuntimeError("FRIGATE_DB is not configured")
+
+    if ssh_host:
+        cmd = [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "ClearAllForwardings=yes",
+        ]
+
+        ssh_port = conf("FRIGATE_DB_SSH_PORT")
+        try:
+            ssh_port = int(ssh_port or 0)
+        except (TypeError, ValueError):
+            ssh_port = 0
+        if ssh_port > 0:
+            cmd.extend(["-p", str(ssh_port)])
+
+        identity = str(conf("FRIGATE_DB_SSH_IDENTITY") or "").strip()
+        if identity:
+            cmd.extend(["-i", os.path.expanduser(identity)])
+
+        remote_cmd = " ".join([
+            "sqlite3",
+            "-readonly",
+            "-json",
+            shlex.quote(frigate_db),
+            shlex.quote(FRIGATE_EVENT_QUERY),
+        ])
+        cmd.extend([ssh_host, remote_cmd])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except FileNotFoundError as e:
+            raise RuntimeError("ssh executable not found") from e
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"Timed out querying Frigate DB over SSH: {ssh_host}") from e
+
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            if detail:
+                detail = detail.splitlines()[-1]
+            raise RuntimeError(
+                f"Remote Frigate DB query failed for {ssh_host}" +
+                (f": {detail}" if detail else "")
+            )
+
+        raw = result.stdout.strip()
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError("Remote sqlite3 returned invalid JSON") from e
+        return [(str(row["id"]), str(row["camera"])) for row in data]
+
+    if not os.path.exists(frigate_db):
+        raise RuntimeError(f"Frigate DB not found: {frigate_db}")
+
+    db_uri = Path(frigate_db).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(db_uri, uri=True)
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        return conn.execute(FRIGATE_EVENT_QUERY).fetchall()
+    finally:
+        conn.close()
+
+
 def trainer_export_dataset(max_images=0):
     """Export snapshots from Frigate DB WITHOUT annotation. Dedup first, annotate later."""
     import sqlite3
@@ -55,22 +145,20 @@ def trainer_export_dataset(max_images=0):
     frigate_db = conf("FRIGATE_DB")
     clips_dir = conf("LIVE_DIR")
 
-    if not os.path.exists(frigate_db):
-        return {"ok": False, "error": f"Frigate DB not found: {frigate_db}"}
-
     _log(f"{'=' * 50}")
     _log(f"EXPORT: Starting")
-    _log(f"  Frigate DB: {frigate_db}")
+    ssh_host = str(conf("FRIGATE_DB_SSH_HOST") or "").strip()
+    _log(f"  Frigate DB: {frigate_db}" + (f" via SSH ({ssh_host})" if ssh_host else ""))
     _log(f"  Clips dir: {clips_dir}")
     _log(f"  Dataset: {STATE['DATASET_DIR']}")
 
     _ss_reset("export", running=True, progress=0, current=0, total=0, message="Loading Frigate DB...")
 
-    conn = sqlite3.connect(frigate_db)
-    rows = conn.execute(
-        "SELECT id, camera FROM event WHERE has_snapshot = 1 ORDER BY start_time DESC"
-    ).fetchall()
-    conn.close()
+    try:
+        rows = _frigate_event_rows()
+    except Exception as e:
+        _ss_reset("export", running=False, progress=0, current=0, total=0, message="Frigate DB query failed")
+        return {"ok": False, "error": str(e)}
 
     if not rows:
         _ss_reset("export", running=False, progress=0, current=0, total=0, message="No events found")
