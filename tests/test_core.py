@@ -62,6 +62,11 @@ CONF_DEFAULTS = {
 def _load_functions(*filenames):
     """Exec source files and return the combined namespace."""
     ns = {
+        # Source modules use package-relative imports such as from .header.
+        # exec() does not provide package context automatically, so emulate
+        # execution as a src submodule.
+        "__name__": "src._test_exec",
+        "__package__": "src",
         "CONF_DEFAULTS": CONF_DEFAULTS,
         "os": os, "sys": sys, "math": math,
         "glob": __import__("glob"),
