@@ -116,7 +116,7 @@ document.addEventListener('change', function(e) {
   const trainerIds = ['exportMaxImages','exportDB','exportClips','exportDataset','exportInputDir',
     'dedupBoxes','dedupPhash','dedupNms','dedupBoxIou','dedupPhashSim','dedupNmsIou',
     'annotateTeacher','annotateConf','annotateMerge',
-    'trainModel','trainEpochs','trainBatch','trainImgsz','trainLR','trainLRF','trainFreeze',
+    'trainModel','trainEpochs','trainBatch','trainPatience','trainImgsz','trainLR','trainLRF','trainFreeze',
     'onnxModel','onnxImgsz','onnxOpset','onnxSimplify','onnxHalf','onnxDynamic'];
   if (trainerIds.includes(el.id)) {
     trainerFormValues[el.id] = el.type === 'checkbox' ? el.checked : el.value;
@@ -127,7 +127,7 @@ document.addEventListener('input', function(e) {
   if (!el.id) return;
   if (el.id === 'exportMaxImages' || el.id === 'dedupBoxIou' || el.id === 'dedupPhashSim' || 
       el.id === 'dedupNmsIou' || el.id === 'annotateConf' || el.id === 'trainEpochs' ||
-      el.id === 'trainBatch' || el.id === 'trainLR' || el.id === 'trainLRF' || 
+      el.id === 'trainBatch' || el.id === 'trainPatience' || el.id === 'trainLR' || el.id === 'trainLRF' || 
       el.id === 'trainImgsz' || el.id === 'trainFreeze' || el.id === 'onnxImgsz' || el.id === 'onnxOpset') {
     trainerFormValues[el.id] = el.value;
   }
@@ -371,6 +371,7 @@ function renderTrainStep() {
   <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:14px">
     <div><div class="sec-label" data-tip="Number of training epochs.">Epochs</div><input type="number" class="num-inp w-full" id="trainEpochs" value="${CONF.EPOCHS || 10}"></div>
     <div><div class="sec-label" data-tip="Images per batch. Lower if OOM.">Batch Size</div><input type="number" class="num-inp w-full" id="trainBatch" value="${CONF.BATCH_SIZE || 8}"></div>
+    <div><div class="sec-label" data-tip="Stop when validation fitness has not improved for this many epochs. Set 0 to disable.">Early Stopping</div><input type="number" class="num-inp w-full" id="trainPatience" value="${CONF.EARLY_STOPPING_PATIENCE ?? 15}" min="0"></div>
     <div><div class="sec-label" data-tip="Input image resolution.">Image Size</div><input type="number" class="num-inp w-full" id="trainImgsz" value="${CONF.IMAGE_SIZE || 640}" step="32"></div>
     <div><div class="sec-label" data-tip="Initial learning rate.">Learning Rate</div><input type="number" class="num-inp w-full" id="trainLR" value="${CONF.LEARNING_RATE || 0.0001}" step="0.0001"></div>
     <div><div class="sec-label" data-tip="Final LR as fraction of initial.">LR Final</div><input type="number" class="num-inp w-full" id="trainLRF" value="${CONF.LR_FINAL || 0.01}" step="0.01"></div>
@@ -937,6 +938,7 @@ function runTrain() {
   if (!model) { showConfigError('No Model Selected', 'Cannot train without a base model. Download a YOLO model first.', 'ai'); return; }
   const epochs = parseInt(getTrainerFormValue('trainEpochs', CONF.EPOCHS || 10));
   const batch = parseInt(getTrainerFormValue('trainBatch', CONF.BATCH_SIZE || 8));
+  const patience = parseInt(getTrainerFormValue('trainPatience', CONF.EARLY_STOPPING_PATIENCE ?? 15));
   const lr = parseFloat(getTrainerFormValue('trainLR', CONF.LEARNING_RATE || 0.0001));
   const lrf = parseFloat(getTrainerFormValue('trainLRF', CONF.LR_FINAL || 0.01));
   const imgsz = parseInt(getTrainerFormValue('trainImgsz', CONF.IMAGE_SIZE || 640));
@@ -949,7 +951,7 @@ function runTrain() {
   fetch('/api/trainer/train', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ model: model, epochs: epochs, batch: batch, lr: lr, lrf: lrf, imgsz: imgsz, freeze: freeze, augment: augment })
+    body: JSON.stringify({ model: model, epochs: epochs, batch: batch, patience: patience, lr: lr, lrf: lrf, imgsz: imgsz, freeze: freeze, augment: augment })
   }).catch(e => { stopTrainerPoll(); toast('Training error: ' + e, true); _resetStep('train'); });
 }
 
@@ -1026,6 +1028,7 @@ function runSelectedPipeline() {
     annotateMerge: getTrainerFormValue('annotateMerge', false),
     trainEpochs: parseInt(getTrainerFormValue('trainEpochs', CONF.EPOCHS || 10)),
     trainBatch:  parseInt(getTrainerFormValue('trainBatch', CONF.BATCH_SIZE || 8)),
+    trainPatience: parseInt(getTrainerFormValue('trainPatience', CONF.EARLY_STOPPING_PATIENCE ?? 15)),
     trainLR:     parseFloat(getTrainerFormValue('trainLR', CONF.LEARNING_RATE || 0.0001)),
     trainLRF:    parseFloat(getTrainerFormValue('trainLRF', CONF.LR_FINAL || 0.01)),
     trainImgsz:  parseInt(getTrainerFormValue('trainImgsz', CONF.IMAGE_SIZE || 640)),
