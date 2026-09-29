@@ -30,9 +30,11 @@ re-fine-tuning.
 
 ## Phase 1 — Initial data run
 
-5. **Export.** Trainer → Export, full (no limit), class filter set to the
-   classes you care about (person, car, …). Each Frigate event lands in
-   exactly one split (sticky, ~10% val) — re-running is safe/idempotent.
+5. **Export.** Trainer → Export, full (no limit). Note: the Frigate query
+   (`SELECT id, camera FROM event WHERE has_snapshot=1`) pulls **all classes,
+   all time** — there is currently *no* class filter at export. If you only
+   want specific classes, filter them out later in the viewer (delete the
+   unwanted images) or treat the rest as a known limitation.
 6. **Dedup.** Trainer → Dedup (pHash on). On a fresh export this just settles
    duplicate frames into the deterministic split — cheap.
 7. **Annotate.** Trainer → Annotate with the teacher model (auto-labels).
