@@ -321,6 +321,7 @@ class LogCapture:
         self._old_stderr = None
         self._pipe_r: Optional[int] = None
         self._pipe_w: Optional[int] = None
+        self._out_file = None
         self._reader_thread: Optional[threading.Thread] = None
 
     def __enter__(self):
@@ -333,7 +334,8 @@ class LogCapture:
         self._pipe_r, self._pipe_w = os.pipe()
         os.dup2(self._pipe_w, 1)
         os.dup2(self._pipe_w, 2)
-        sys.stdout = io.TextIOWrapper(os.fdopen(self._pipe_w, 'wb', 0), write_through=True)
+        self._out_file = os.fdopen(self._pipe_w, 'wb', 0)
+        sys.stdout = io.TextIOWrapper(self._out_file, write_through=True)
         sys.stderr = sys.stdout
 
         def _reader():
@@ -384,6 +386,18 @@ class LogCapture:
         sys.stdout = self._old_stdout
         sys.stderr = self._old_stderr
         LogCapture._fd_lock.release()
+        # Close the pipe write-end (via its file object) so the reader thread
+        # sees EOF, drains any buffered bytes, and exits. Without this the
+        # write-end fd (and the reader thread) leaked on every capture.
+        if self._out_file is not None:
+            try:
+                self._out_file.close()
+            except OSError:
+                pass
+            self._out_file = None
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=2.0)
+            self._reader_thread = None
 
 
 DATASET_VERSION = 0

@@ -38,6 +38,26 @@ def _json_err(msg: str, status: int = 400) -> tuple[int, str, bytes]:
     return status, "application/json", json.dumps({"ok": False, "error": msg}).encode()
 
 
+def _datasets_root() -> str:
+    """Root that dataset directories must live under."""
+    return conf("DATASETS_ROOT") or os.path.dirname(STATE["DATASET_DIR"])
+
+
+def _guard_rel(root: str, *parts: str) -> bool:
+    """True if joining *parts* onto *root* stays inside *root*.
+
+    Each part must be a single non-empty path component (no separators, no
+    '.'/'..', not absolute). Rejects client-supplied names/splits that would
+    otherwise escape the dataset via path traversal (arbitrary read/write).
+    """
+    for p in parts:
+        if not isinstance(p, str) or not p or p in (".", ".."):
+            return False
+        if os.path.isabs(p) or "/" in p or "\\" in p:
+            return False
+    return validate_path(os.path.join(root, *parts), root) is not None
+
+
 # ============================================================
 # GET ROUTE HANDLERS
 # ============================================================
@@ -610,6 +630,10 @@ def _post_models_download(body: dict) -> tuple[int, str, bytes]:
 
 def _post_save(body: dict) -> tuple[int, str, bytes]:
     split, name, nb = body["split"], body["name"], body["boxes"]
+    root = STATE["DATASET_DIR"]
+    stem_txt = os.path.splitext(name)[0] + ".txt"
+    if not _guard_rel(root, "images", split, name) or not _guard_rel(root, "labels", split, stem_txt):
+        return _json_err("Invalid path")
     write_boxes(get_label_path(split, name), nb)
     cls_in = list(set(b["cls"] for b in nb))
     with _state_lock:
@@ -624,6 +648,10 @@ def _post_save(body: dict) -> tuple[int, str, bytes]:
 
 def _post_del(body: dict) -> tuple[int, str, bytes]:
     split, name = body["split"], body["name"]
+    root = STATE["DATASET_DIR"]
+    stem_txt = os.path.splitext(name)[0] + ".txt"
+    if not _guard_rel(root, "images", split, name) or not _guard_rel(root, "labels", split, stem_txt):
+        return _json_err("Invalid path")
     for p in [os.path.join(STATE["DATASET_DIR"], "images", split, name),
               get_label_path(split, name)]:
         if os.path.exists(p):
@@ -635,8 +663,11 @@ def _post_del(body: dict) -> tuple[int, str, bytes]:
 
 
 def _post_ai(body: dict) -> tuple[int, str, bytes]:
+    split, name = body["split"], body["name"]
+    if not _guard_rel(STATE["DATASET_DIR"], "images", split, name):
+        return _json_err("Invalid path")
     result = run_ai_analyse(
-        body["split"], body["name"],
+        split, name,
         body["model"], body["conf"],
         set(body["classes"])
     )
@@ -644,6 +675,8 @@ def _post_ai(body: dict) -> tuple[int, str, bytes]:
 
 
 def _post_preview_ai(body: dict) -> tuple[int, str, bytes]:
+    if not _guard_rel(STATE["DATASET_DIR"], "images", body["split"], body["name"]):
+        return _json_err("Invalid path")
     img_path = os.path.join(STATE["DATASET_DIR"], "images", body["split"], body["name"])
     result = run_ai_preview(img_path, body["model"], body.get("conf", 0.7),
                             set(body.get("classes", conf("DEFAULT_CLASSES"))))
@@ -706,13 +739,26 @@ def _post_copymove(body: dict) -> tuple[int, str, bytes]:
         dst_name = os.path.splitext(src_name)[0] + ".jpg"
         # Strip Frigate's "-clean" suffix if present
         dst_name = dst_name.replace("-clean.jpg", ".jpg")
+        if not _guard_rel(live_dir, src_name):
+            return _json_err("Invalid path")
     else:
-        src_img = os.path.join(STATE["DATASET_DIR"], "images", src_split, src_name)
+        root = STATE["DATASET_DIR"]
+        src_img = os.path.join(root, "images", src_split, src_name)
         src_lbl = get_label_path(src_split, src_name)
         dst_name = src_name
+        stem_txt = os.path.splitext(src_name)[0] + ".txt"
+        if not _guard_rel(root, "images", src_split, src_name) or not _guard_rel(root, "labels", src_split, stem_txt):
+            return _json_err("Invalid path")
 
     dst_img_dir = os.path.join(dst_dataset, "images", dst_split)
     dst_lbl_dir = os.path.join(dst_dataset, "labels", dst_split)
+    # Destination dataset must live under the datasets root; dst components
+    # must not escape it.
+    if validate_path(dst_dataset, _datasets_root()) is None:
+        return _json_err("Invalid destination dataset")
+    dst_stem_txt = os.path.splitext(dst_name)[0] + ".txt"
+    if not _guard_rel(dst_dataset, "images", dst_split, dst_name) or not _guard_rel(dst_dataset, "labels", dst_split, dst_stem_txt):
+        return _json_err("Invalid destination path")
     os.makedirs(dst_img_dir, exist_ok=True)
     os.makedirs(dst_lbl_dir, exist_ok=True)
     dst_img = os.path.join(dst_img_dir, dst_name)
@@ -765,6 +811,8 @@ def _post_copymove(body: dict) -> tuple[int, str, bytes]:
 
 def _post_switch(body: dict) -> tuple[int, str, bytes]:
     new_path = body["path"]
+    if validate_path(new_path, _datasets_root()) is None:
+        return _json_err("Invalid dataset")
     if os.path.exists(os.path.join(new_path, "images")):
         STATE["DATASET_DIR"] = new_path
         rebuild_image_list()
@@ -827,7 +875,17 @@ def _post_settings_save(body: dict) -> tuple[int, str, bytes]:
     old_exports = CONF.get("EXPORTS_DIR", "")
     old_models = CONF.get("MODELS_DIR", "")
     for key, val in body.items():
-        CONF[key] = _parse_value(str(val)) if isinstance(val, str) else val
+        # Only touch keys that are known configuration; never inject new keys
+        # into alice.conf from an untrusted client.
+        if key not in CONF_DEFAULTS:
+            continue
+        # Normalize every value through the same parser the conf file loader
+        # uses, so CONF types always match what load_conf() would produce.
+        # (Storing raw JSON ints/bools/lists here previously corrupted types
+        # for path/number keys on the next load.)
+        if not isinstance(val, str):
+            val = str(val)
+        CONF[key] = _parse_value(val)
     save_conf(STATE["CONF_PATH"], CONF)
     # Rescan only when paths actually changed
     if CONF.get("LIVE_DIR", "") != old_live:
