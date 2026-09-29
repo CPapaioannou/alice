@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+import zlib
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +15,12 @@ from .header import (
     CONF, CONF_DEFAULTS, STATE, IMAGE_LIST, LIVE_LIST, LIVE_ALL, LIVE_CAMERAS,
     VIDEO_LIST, _state_lock, conf,
 )
+
+# Fraction of events that are permanently assigned to the val split.
+# See assign_split() — the assignment is deterministic (crc32 of the event id),
+# so re-running export/dedup never re-rolls train/val membership.
+VAL_SPLIT_PERCENT = 10
+
 
 def scan_datasets():
     """Find all dataset directories (contain images/ subfolder)."""
@@ -140,6 +147,16 @@ def get_label_path(split, name):
     """Get label file path for an image (strips any image extension, adds .txt)."""
     stem = os.path.splitext(name)[0]
     return os.path.join(STATE["DATASET_DIR"], "labels", split, stem + ".txt")
+
+def assign_split(event_id: str) -> str:
+    """Deterministically assign an event to the 'train' or 'val' split (~10% val).
+
+    Based on zlib.crc32 of the event id so the assignment is stable across
+    runs, machines, and processes (Python's builtin hash() is salted and
+    is NOT stable). The same event always maps to the same split, so
+    repeated exports and dedup passes never re-roll train/val membership.
+    """
+    return "val" if (zlib.crc32(str(event_id).encode("utf-8")) % 100) < VAL_SPLIT_PERCENT else "train"
 
 
 def read_boxes(label_path: str) -> list[dict]:
