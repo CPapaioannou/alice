@@ -4,6 +4,7 @@
 
 import math
 import os
+import threading
 from typing import Optional
 
 from .header import (
@@ -127,7 +128,7 @@ def _compute_phash_from_pixels(pixels: list, size: int = 32) -> int:
     """Compute 64-bit perceptual hash from a flat list of grayscale pixel values.
 
     Shared implementation used by both the main-thread ``compute_phash``
-    and the multiprocessing ``_phash_worker``.
+    and the thread-pool ``_phash_worker``.
     """
     def dct1d(v):
         N = len(v)
@@ -197,12 +198,33 @@ def precompute_all_hashes():
     return count
 
 
-def ensure_hashes_computed():
-    """Compute hashes using multiprocessing for any images not yet cached."""
-    # Evict deleted files from cache
-    stale = [p for p in PHASH_CACHE if not os.path.exists(p)]
-    for p in stale:
-        del PHASH_CACHE[p]
+# ------------------------------------------------------------------
+# pHash warmup / parallel computation
+# ------------------------------------------------------------------
+# Replaces the previous design of spawning a multiprocessing.Pool on every
+# request (which forked up to 8 processes per "find similar" click and
+# re-imported the app on spawn start-method platforms). A single shared
+# ThreadPoolExecutor is created lazily and reused; PIL releases the GIL while
+# decoding images, so threads give a good speedup without the process-fork
+# cost. A background warmup thread (precompute_hashes_async) keeps the cache
+# hot so the per-request path is normally just a cache read.
+
+_PHASH_EXECUTOR = None
+_PHASH_WARM = {"sig": None, "fut": None}
+
+
+def _get_phash_executor():
+    global _PHASH_EXECUTOR
+    if _PHASH_EXECUTOR is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _PHASH_EXECUTOR = ThreadPoolExecutor(
+            max_workers=min(os.cpu_count() or 4, 8),
+            thread_name_prefix="phash")
+    return _PHASH_EXECUTOR
+
+
+def _phash_dataset_paths():
+    """All current dataset image paths (train + val)."""
     paths = []
     for split in ["train", "val"]:
         img_dir = os.path.join(STATE["DATASET_DIR"], "images", split)
@@ -210,26 +232,77 @@ def ensure_hashes_computed():
             continue
         for img_file in sorted(os.listdir(img_dir)):
             if img_file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                full = os.path.join(img_dir, img_file)
-                if full not in PHASH_CACHE:
-                    paths.append(full)
-    if not paths:
+                paths.append(os.path.join(img_dir, img_file))
+    return paths
+
+
+def _phash_dataset_sig():
+    """Stable identity for the set of images we need hashes for."""
+    return (STATE["DATASET_DIR"], len(_phash_dataset_paths()))
+
+
+def _phash_fill_missing():
+    """Fill PHASH_CACHE for the current dataset, in parallel, in-process."""
+    # Evict deleted files from the cache.
+    for p in [p for p in PHASH_CACHE if not os.path.exists(p)]:
+        del PHASH_CACHE[p]
+    missing = [p for p in _phash_dataset_paths() if p not in PHASH_CACHE]
+    if not missing:
         return
+    ex = _get_phash_executor()
+    futs = {p: ex.submit(_phash_worker, p) for p in missing}
+    for p, fut in futs.items():
+        try:
+            h = fut.result()
+        except Exception:
+            h = None
+        if h is not None:
+            PHASH_CACHE[p] = h
+
+
+def _phash_warmup():
     try:
-        from multiprocessing import Pool, cpu_count
-        workers = min(cpu_count(), 8)
-        with Pool(workers) as pool:
-            results = pool.map(_phash_worker, paths)
-        for path, h in zip(paths, results):
-            if h is not None:
-                PHASH_CACHE[path] = h
+        _phash_fill_missing()
     except Exception:
-        for p in paths:
-            compute_phash(p)
+        pass
+
+
+def precompute_hashes_async():
+    """Kick off a background warmup of PHASH_CACHE for the current dataset.
+
+    Called on dataset switch / create / reload / initial load so the cache is
+    warm before the user asks for "find similar". Repeated calls for the same
+    dataset state are cheap no-ops.
+    """
+    sig = _phash_dataset_sig()
+    if _PHASH_WARM["sig"] == sig and _PHASH_WARM["fut"] is not None:
+        return _PHASH_WARM["fut"]
+    t = threading.Thread(target=_phash_warmup, daemon=True)
+    _PHASH_WARM["sig"] = sig
+    _PHASH_WARM["fut"] = t
+    t.start()
+    return t
+
+
+def ensure_hashes_computed():
+    """Ensure hashes for the current dataset are available (no per-call fork).
+
+    Waits for an in-flight background warmup of this dataset, then fills any
+    still-missing hashes via the shared thread pool.
+    """
+    sig = _phash_dataset_sig()
+    if _PHASH_WARM["sig"] == sig and _PHASH_WARM["fut"] is not None:
+        try:
+            _PHASH_WARM["fut"].join(timeout=60)
+        except Exception:
+            pass
+    # Fallback: fill anything the warmup didn't cover (warmup never ran for
+    # this dataset, or new files appeared since it started).
+    _phash_fill_missing()
 
 
 def _phash_worker(path: str) -> Optional[int]:
-    """Multiprocessing worker for pHash computation."""
+    """Compute the pHash for one image (runs in the shared thread pool)."""
     try:
         from PIL import Image as PILImage
         im = PILImage.open(path).convert('L').resize((32, 32), PILImage.LANCZOS)

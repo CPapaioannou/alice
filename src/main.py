@@ -16,6 +16,7 @@ from .header import (
 )
 from .config import check_dependencies, generate_default_conf, load_conf
 from .core import build_image_list, scan_live_images, scan_models, scan_video_exports, sort_image_list, start_watchers
+from .ai_phash_video import precompute_hashes_async
 from .handler import Handler
 
 class ThreadedHTTPServer(HTTPServer):
@@ -114,6 +115,7 @@ if __name__ == "__main__":
     MODELS_LIST.clear(); MODELS_LIST.extend(scan_models())
     scan_live_images("all", 24)
     scan_video_exports()
+    precompute_hashes_async()
 
     t = len(IMAGE_LIST)
     e = sum(1 for x in IMAGE_LIST if x["boxes"] == 0)

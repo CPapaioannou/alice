@@ -271,14 +271,19 @@ def get_filtered(filt, class_filter=-1, pin_split=None, pin_name=None):
     position (preserving IMAGE_LIST order). This keeps the image the user
     is currently viewing visible until they navigate away from it.
     """
+    # Take a consistent snapshot under the state lock: rebuild_image_list()
+    # does clear()+extend() under the same lock, so without this a
+    # concurrent rebuild could hand us a torn (partial/empty) list.
+    with _state_lock:
+        snapshot = list(IMAGE_LIST)
     if filt == 'train':
-        lst = [x for x in IMAGE_LIST if x["split"] == 'train']
+        lst = [x for x in snapshot if x["split"] == 'train']
     elif filt == 'val':
-        lst = [x for x in IMAGE_LIST if x["split"] == 'val']
+        lst = [x for x in snapshot if x["split"] == 'val']
     elif filt == 'empty':
-        lst = [x for x in IMAGE_LIST if x["boxes"] == 0]
+        lst = [x for x in snapshot if x["boxes"] == 0]
     else:
-        lst = list(IMAGE_LIST)
+        lst = list(snapshot)
     if class_filter >= 0:
         lst = [x for x in lst if class_filter in x["classes"]]
 
@@ -287,16 +292,19 @@ def get_filtered(filt, class_filter=-1, pin_split=None, pin_name=None):
         already = any(x["split"] == pin_split and x["name"] == pin_name for x in lst)
         if not already:
             pinned = next(
-                (x for x in IMAGE_LIST
+                (x for x in snapshot
                  if x["split"] == pin_split and x["name"] == pin_name),
                 None,
             )
             if pinned is not None:
-                # Insert at natural position based on IMAGE_LIST ordering.
-                pin_pos = IMAGE_LIST.index(pinned)
+                # Insert at natural position. Build an O(n) id->index map of
+                # the snapshot once, so the insert-point scan is O(len(lst))
+                # instead of the old O(n^2) IMAGE_LIST.index-per-item loop.
+                pos = {id(x): i for i, x in enumerate(snapshot)}
+                pin_pos = pos.get(id(pinned), -1)
                 insert_at = len(lst)
                 for j, item in enumerate(lst):
-                    if IMAGE_LIST.index(item) > pin_pos:
+                    if pos.get(id(item), -1) > pin_pos:
                         insert_at = j
                         break
                 lst.insert(insert_at, pinned)
