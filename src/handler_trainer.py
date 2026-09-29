@@ -10,9 +10,9 @@ from contextlib import contextmanager
 
 from .header import (
     CONF, CONF_DEFAULTS, IMAGE_LIST, MODELS_LIST, STATE,
-    STEP_STATUS, TRAINER_LOG, _state_lock, conf,
+    STEP_STATUS, TRAINER_LOG, _state_lock, conf, validate_path,
 )
-from .handler_api import _json_ok, _json_err
+from .handler_api import _json_ok, _json_err, _datasets_root
 from .core import (
     build_image_list, rebuild_image_list, scan_models, sort_image_list,
 )
@@ -78,6 +78,8 @@ def _post_trainer_report_save(body: dict) -> tuple[int, str, bytes]:
 
 def _post_trainer_set_dataset(body: dict) -> tuple[int, str, bytes]:
     new_path = body.get("path", "")
+    if not new_path or validate_path(new_path, _datasets_root()) is None:
+        return _json_err("Invalid dataset path")
     if os.path.exists(os.path.join(new_path, "images")):
         STATE["TRAINER_DATASET"] = new_path
         return _json_ok({"ok": True, "dataset": new_path})
@@ -116,12 +118,37 @@ def _trainer_dataset(tds):
         STATE["DATASET_DIR"] = saved
 
 
+# Single global trainer run lock: at most one trainer step (export/dedup/
+# annotate/train/onnx/pipeline) may run at a time. This protects the global
+# STATE["DATASET_DIR"] swap done by _trainer_dataset() from being clobbered
+# by a concurrently-launched step, and stops two steps fighting over the same
+# output files. Acquired inside the worker thread (not the request thread) so
+# a request never blocks; the handlers just pre-check _trainer_busy().
+TRAINER_RUN_LOCK = threading.Lock()
+
+
+def _trainer_busy() -> bool:
+    return TRAINER_RUN_LOCK.locked()
+
+
+@contextmanager
+def _trainer_step():
+    """Hold the global trainer run lock for the duration of one step."""
+    TRAINER_RUN_LOCK.acquire()
+    try:
+        yield
+    finally:
+        TRAINER_RUN_LOCK.release()
+
+
 def _post_trainer_export(body: dict) -> tuple[int, str, bytes]:
+    if _trainer_busy():
+        return _json_err("Another trainer step is already running")
     max_images = int(body.get("max_images", 0))
     _tds = STATE["TRAINER_DATASET"] or STATE["DATASET_DIR"]
 
     def _run_export():
-        with _trainer_dataset(_tds):
+        with _trainer_step(), _trainer_dataset(_tds):
             trainer_export_dataset(max_images=max_images)
             STATE["TRAINER_DATASET"] = _tds
             rebuild_image_list()
@@ -132,6 +159,8 @@ def _post_trainer_export(body: dict) -> tuple[int, str, bytes]:
 
 
 def _post_trainer_reannotate(body: dict) -> tuple[int, str, bytes]:
+    if _trainer_busy():
+        return _json_err("Another trainer step is already running")
     teacher = body.get("teacher", conf("TEACHER_MODEL"))
     if not teacher:
         return _json_err("No teacher model configured. Set it in Settings \u2192 AI.")
@@ -142,7 +171,7 @@ def _post_trainer_reannotate(body: dict) -> tuple[int, str, bytes]:
     _tds = STATE["TRAINER_DATASET"] or STATE["DATASET_DIR"]
 
     def _run_annotate():
-        with _trainer_dataset(_tds):
+        with _trainer_step(), _trainer_dataset(_tds):
             trainer_reannotate(teacher_path, ann_conf, classes, merge=merge)
             rebuild_image_list()
 
@@ -152,11 +181,13 @@ def _post_trainer_reannotate(body: dict) -> tuple[int, str, bytes]:
 
 
 def _post_trainer_dedup(body: dict) -> tuple[int, str, bytes]:
+    if _trainer_busy():
+        return _json_err("Another trainer step is already running")
     _tds = STATE["TRAINER_DATASET"] or STATE["DATASET_DIR"]
     _dry_run = body.get("dry_run", False)
 
     def _run_dedup():
-        with _trainer_dataset(_tds):
+        with _trainer_step(), _trainer_dataset(_tds):
             trainer_dedup_run(
                 boxes=body.get("boxes", False),
                 phash=body.get("phash", False),
@@ -175,6 +206,8 @@ def _post_trainer_dedup(body: dict) -> tuple[int, str, bytes]:
 
 
 def _post_trainer_train(body: dict) -> tuple[int, str, bytes]:
+    if _trainer_busy():
+        return _json_err("Another trainer step is already running")
     model = body.get("model", "")
     if not model:
         return _json_err("No student model configured. Set it in Settings \u2192 AI.")
@@ -190,7 +223,7 @@ def _post_trainer_train(body: dict) -> tuple[int, str, bytes]:
     _tds = STATE["TRAINER_DATASET"] or STATE["DATASET_DIR"]
 
     def _run_train():
-        with _trainer_dataset(_tds):
+        with _trainer_step(), _trainer_dataset(_tds):
             trainer_train(model_path, _epochs, _batch, _lr, _lrf, _imgsz, _freeze, _augment, _patience)
         with _state_lock:
             MODELS_LIST.clear(); MODELS_LIST.extend(scan_models())
@@ -201,6 +234,8 @@ def _post_trainer_train(body: dict) -> tuple[int, str, bytes]:
 
 
 def _post_trainer_onnx(body: dict) -> tuple[int, str, bytes]:
+    if _trainer_busy():
+        return _json_err("Another trainer step is already running")
     model = body.get("model", "")
     if not model:
         return _json_err("No model specified for ONNX export.")
@@ -212,7 +247,8 @@ def _post_trainer_onnx(body: dict) -> tuple[int, str, bytes]:
     _dynamic = body.get("dynamic", False)
 
     def _run_onnx():
-        trainer_export_onnx(model_path, _imgsz, _opset, _simplify, _half, _dynamic)
+        with _trainer_step():
+            trainer_export_onnx(model_path, _imgsz, _opset, _simplify, _half, _dynamic)
 
     t = threading.Thread(target=_safe_trainer_thread(_run_onnx, "onnx"), daemon=True)
     t.start()
@@ -230,7 +266,9 @@ def _post_trainer_pipeline_run(body: dict) -> tuple[int, str, bytes]:
     if not steps:
         return _json_err("No steps provided")
 
-    # Pre-flight: reject if any step already running
+    # Pre-flight: reject if any step already running (or the run lock is held)
+    if _trainer_busy():
+        return _json_err("A trainer step is already running")
     for s in STEP_STATUS.values():
         if s.get("running"):
             return _json_err("A trainer step is already running")
@@ -252,7 +290,7 @@ def _post_trainer_pipeline_run(body: dict) -> tuple[int, str, bytes]:
                 _t.sleep(0.5)
 
         try:
-            with _trainer_dataset(_tds):
+            with _trainer_step(), _trainer_dataset(_tds):
                 for step_name in steps:
                     if not STATE["PIPELINE_STATE"]:
                         TRAINER_LOG.append("PIPELINE: Aborted")
