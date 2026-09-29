@@ -26,7 +26,8 @@ from .core import (
 )
 from .ai_phash_video import (
     export_video_frame, extract_video_frame, find_similar_images, find_similar_live,
-    get_video_info, run_ai_analyse, run_ai_preview, run_video_frame_ai,
+    get_video_info, precompute_hashes_async, run_ai_analyse, run_ai_preview,
+    run_video_frame_ai,
 )
 def _json_ok(data: dict) -> tuple[int, str, bytes]:
     """Return a successful JSON response tuple."""
@@ -166,6 +167,7 @@ def _get_api_reload(params: dict) -> tuple[int, str, bytes]:
     with _state_lock:
         MODELS_LIST.clear(); MODELS_LIST.extend(scan_models())
     PHASH_CACHE.clear()
+    precompute_hashes_async()
     return _json_ok({"ok": True, "images": len(IMAGE_LIST), "models": len(MODELS_LIST)})
 
 
@@ -817,6 +819,7 @@ def _post_switch(body: dict) -> tuple[int, str, bytes]:
         STATE["DATASET_DIR"] = new_path
         rebuild_image_list()
         PHASH_CACHE.clear()
+        precompute_hashes_async()
         return _json_ok({"ok": True, "total": len(IMAGE_LIST), "name": os.path.basename(new_path)})
     return _json_err("Invalid dataset")
 
@@ -842,6 +845,7 @@ def _post_dataset_create(body: dict) -> tuple[int, str, bytes]:
     STATE["DATASET_DIR"] = new_path
     rebuild_image_list()
     PHASH_CACHE.clear()
+    precompute_hashes_async()
     return _json_ok({
         "ok": True,
         "name": safe,
