@@ -16,6 +16,11 @@ from .header import (
     VIDEO_LIST, _state_lock, conf,
 )
 
+# Matches the Unix-timestamp prefix of a Frigate event id embedded in an
+# image name, e.g. '1790589611.837512-k5vr9z.jpg' -> 1790589611.837512
+_CAPTURE_TS_RE = re.compile(r'^(\d{10,13}(?:\.\d+)?)')
+
+
 # Fraction of events that are permanently assigned to the val split.
 # See assign_split() — the assignment is deterministic (crc32 of the event id),
 # so re-running export/dedup never re-rolls train/val membership.
@@ -138,10 +143,27 @@ def build_image_list():
             images.append({
                 "split": split, "name": img.name,
                 "boxes": box_count, "classes": list(classes_present),
-                "mtime": mtime
+                "mtime": mtime,
+                "capture_ts": event_capture_ts(img.name)
             })
     return images
 
+
+def event_capture_ts(name: str) -> float:
+    """Extract the capture Unix timestamp from an image name.
+
+    Frigate event ids look like '1790589611.837512-k5vr9z' — the leading
+    component is the event's Unix timestamp, so image names of the form
+    '{event_id}.jpg' carry their own capture time. Returns 0.0 when the
+    name carries no timestamp (video frames, external imports).
+    """
+    m = _CAPTURE_TS_RE.match(os.path.splitext(name)[0])
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return 0.0
 
 def get_label_path(split, name):
     """Get label file path for an image (strips any image extension, adds .txt)."""
@@ -199,10 +221,22 @@ def box_iou(a, b):
 
 
 def sort_image_list():
-    """Re-sort IMAGE_LIST based on current CONF.SORT_ORDER."""
+    """Re-sort IMAGE_LIST based on current CONF.SORT_ORDER.
+
+    Modes:
+      event    — chronological by capture time (parsed from the Frigate
+                 event-id timestamp in the filename). Images without a
+                 timestamp (video frames, external imports) sort last.
+      modified — last image/label modification time
+      filename — (split, name)
+    """
     sort_order = conf("SORT_ORDER")
     if sort_order == "modified":
         IMAGE_LIST.sort(key=lambda x: x.get("mtime", 0))
+    elif sort_order == "event":
+        IMAGE_LIST.sort(key=lambda x: (x.get("capture_ts", 0) == 0,
+                                        x.get("capture_ts", 0),
+                                        x["split"], x["name"]))
     else:
         IMAGE_LIST.sort(key=lambda x: (x["split"], x["name"]))
 
@@ -298,6 +332,35 @@ def get_stats():
 # FILESYSTEM WATCHERS (inotify)
 # ============================================================
 
+def _drain_watch_events(events, on_match, exts):
+    """Consume an inotify event stream, calling on_match() at most twice per
+    burst of matching file events.
+
+    The first matching event fires on_match() immediately (so a single
+    manual edit still updates the UI at once); further matches are
+    coalesced and flushed once, either on a quiet tick (a None from
+    event_gen(yield_nones=True)) or at the end of the stream. Driven with
+    event_gen(timeout_s=1, yield_nones=False) the stream ends after 1s of
+    quiet, so a bulk export of N files costs ~2 rebuilds, not N.
+    """
+    matches = 0
+    for event in events:
+        if event is None:
+            if matches > 1:
+                on_match()
+            matches = 0
+            continue
+        try:
+            filename = event[3]
+        except (IndexError, TypeError):
+            continue
+        if filename.endswith(exts):
+            matches += 1
+            if matches == 1:
+                on_match()
+    if matches > 1:
+        on_match()
+
 def start_watchers():
     """Start inotify watchers on dataset, live, and video directories."""
     try:
@@ -309,6 +372,7 @@ def start_watchers():
 
     def _watch_dataset():
         import inotify.adapters
+        exts = ('.jpg', '.jpeg', '.png', '.webp', '.txt')
         while True:
             try:
                 i = inotify.adapters.InotifyTrees(
@@ -316,16 +380,26 @@ def start_watchers():
                     mask=inotify.constants.IN_CREATE | inotify.constants.IN_DELETE |
                          inotify.constants.IN_MOVED_TO | inotify.constants.IN_MOVED_FROM
                 )
-                for event in i.event_gen(yield_nones=False):
-                    (_, type_names, path, filename) = event
-                    if filename.endswith(('.jpg', '.jpeg', '.png', '.webp', '.txt')):
-                        rebuild_image_list()
+                # Debounced: the generator ends after 1s of quiet, and the
+                # drain coalesces each burst to ~2 rebuilds, not one per file
+                while True:
+                    _drain_watch_events(
+                        i.event_gen(timeout_s=1, yield_nones=False),
+                        rebuild_image_list,
+                        exts,
+                    )
             except Exception as e:
                 print(f"  Dataset watcher error: {e}")
                 time.sleep(5)
 
     def _watch_live():
         import inotify.adapters
+        exts = ('.webp', '.jpg', '.png')
+
+        def _on_live_change():
+            scan_live_images("all", 24)
+            STATE["LIVE_VERSION"] += 1
+
         while True:
             live_dir = conf("LIVE_DIR")
             if not live_dir or not os.path.exists(live_dir):
@@ -336,11 +410,13 @@ def start_watchers():
                 i.add_watch(live_dir,
                     mask=inotify.constants.IN_CREATE | inotify.constants.IN_DELETE |
                          inotify.constants.IN_MOVED_TO)
-                for event in i.event_gen(yield_nones=False):
-                    (_, type_names, path, filename) = event
-                    if filename.endswith(('.webp', '.jpg', '.png')):
-                        scan_live_images("all", 24)
-                        STATE["LIVE_VERSION"] += 1
+                # Debounced: many snapshots in a short window = one rescan
+                while True:
+                    _drain_watch_events(
+                        i.event_gen(timeout_s=1, yield_nones=False),
+                        _on_live_change,
+                        exts,
+                    )
             except Exception as e:
                 print(f"  Live watcher error: {e}")
                 time.sleep(5)

@@ -67,7 +67,7 @@ CONF_DEFAULTS = {
     "DEVICE": "auto",
     # Interface
     "HELPERS_ENABLED": True,
-    "SORT_ORDER": "modified",
+    "SORT_ORDER": "event",
     "WELCOME_DISMISSED": False,
     # Dedup Defaults
     "DEDUP_BOXES": False,

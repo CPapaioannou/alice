@@ -330,6 +330,7 @@
         <div>
           <div class="sec-label" data-tip="How images are ordered.">Sort Order</div>
           <select class="sel" id="s_SORT_ORDER" style="width:100%">
+            <option value="event">Capture Time (event)</option>
             <option value="modified">Last Modified</option>
             <option value="filename">Filename (A-Z)</option>
           </select>
