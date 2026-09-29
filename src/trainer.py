@@ -6,11 +6,11 @@ import csv
 import glob
 import json
 import os
-import random
 import shlex
 import shutil
 import sqlite3
 import subprocess
+import zlib
 from collections import defaultdict
 from pathlib import Path
 
@@ -18,7 +18,7 @@ from .header import (
     CLASS_NAMES, CONF, CONF_DEFAULTS, STATE, LogCapture, STEP_STATUS, TRAINER_LOG, conf,
     resolve_device,
 )
-from .core import box_iou, read_boxes, write_boxes
+from .core import VAL_SPLIT_PERCENT, assign_split, box_iou, read_boxes, write_boxes
 from .ai_phash_video import compute_phash
 
 def _log(msg):
@@ -194,14 +194,25 @@ def trainer_export_dataset(max_images=0):
         os.makedirs(os.path.join(STATE["DATASET_DIR"], "images", split), exist_ok=True)
         os.makedirs(os.path.join(STATE["DATASET_DIR"], "labels", split), exist_ok=True)
 
-    import random
-    camera_map = {}
+    camera_map = _load_camera_map()
     exported, skipped, existing = 0, 0, 0
 
-    # Pre-compute train/val split — guarantee at least 1 val image
-    random.shuffle(rows)
-    n_val = max(1, len(rows) // 10)  # 10%, minimum 1
-    val_ids = set(r[0] for r in rows[:n_val])
+    # Sticky, deterministic train/val split:
+    #  - events already exported keep the split their image lives in, so
+    #    re-running the export never re-rolls splits or re-copies files
+    #  - brand-new events get a stable per-event assignment (crc32-based),
+    #    so the split choice is identical on every future run
+    existing_split = {}
+    for split in ("train", "val"):
+        img_dir = os.path.join(STATE["DATASET_DIR"], "images", split)
+        if not os.path.exists(img_dir):
+            continue
+        for f in os.listdir(img_dir):
+            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                existing_split.setdefault(Path(f).stem, split)
+
+    def _split_for(event_id):
+        return existing_split.get(event_id) or assign_split(event_id)
 
     for idx, (event_id, camera) in enumerate(rows):
         # Check stop
@@ -223,7 +234,7 @@ def trainer_export_dataset(max_images=0):
             skipped += 1
             continue
 
-        split = "val" if event_id in val_ids else "train"
+        split = _split_for(event_id)
         out_img = os.path.join(STATE["DATASET_DIR"], "images", split, f"{event_id}.jpg")
 
         # Skip if already exists (reuse)
@@ -246,7 +257,52 @@ def trainer_export_dataset(max_images=0):
         exported += 1
         camera_map[event_id] = camera
 
-    # Save camera map for dedup
+    # ---- Integrity cleanup -------------------------------------------------
+    # Historical bug: export used to re-roll the 90/10 split every run, leaving
+    # the same event image (with possibly divergent labels) in BOTH splits.
+    # Clean that up: merge the labels, keep the canonical split's copy.
+    dupes_removed = 0
+    for event_id, keep_split in sorted(existing_split.items()):
+        other = "val" if keep_split == "train" else "train"
+        keep_img = os.path.join(STATE["DATASET_DIR"], "images", keep_split, f"{event_id}.jpg")
+        other_img = os.path.join(STATE["DATASET_DIR"], "images", other, f"{event_id}.jpg")
+        if not (os.path.exists(keep_img) and os.path.exists(other_img)):
+            continue
+        # Merge boxes from the stale copy's label into the canonical label
+        keep_lbl = os.path.join(STATE["DATASET_DIR"], "labels", keep_split, f"{event_id}.txt")
+        other_lbl = os.path.join(STATE["DATASET_DIR"], "labels", other, f"{event_id}.txt")
+        keep_boxes = read_boxes(keep_lbl)
+        stale_boxes = read_boxes(other_lbl) if os.path.exists(other_lbl) else []
+        for sb in stale_boxes:
+            if not any(sb["cls"] == kb["cls"] and box_iou(sb, kb) > 0.5 for kb in keep_boxes):
+                keep_boxes.append(sb)
+        write_boxes(keep_lbl, keep_boxes)
+        os.remove(other_img)
+        if os.path.exists(other_lbl):
+            os.remove(other_lbl)
+        dupes_removed += 1
+
+    # Remove orphan label files (label without its image)
+    orphans_removed = 0
+    img_exts = ('.jpg', '.jpeg', '.png', '.webp')
+    for split in ("train", "val"):
+        labels_dir = os.path.join(STATE["DATASET_DIR"], "labels", split)
+        if not os.path.exists(labels_dir):
+            continue
+        images_dir = os.path.join(STATE["DATASET_DIR"], "images", split)
+        have_images = set()
+        if os.path.exists(images_dir):
+            have_images = {Path(f).stem for f in os.listdir(images_dir)
+                           if f.lower().endswith(img_exts)}
+        for lbl in os.listdir(labels_dir):
+            if lbl.endswith(".txt") and Path(lbl).stem not in have_images:
+                os.remove(os.path.join(labels_dir, lbl))
+                orphans_removed += 1
+
+    if dupes_removed or orphans_removed:
+        _log(f"EXPORT: CLEANED — {dupes_removed} cross-split duplicates, {orphans_removed} orphan labels removed")
+
+    # Save camera map for dedup (merged with previous runs)
     camera_map_path = os.path.join(STATE["DATASET_DIR"], "camera_map.json")
     with open(camera_map_path, "w") as f:
         json.dump(camera_map, f)
@@ -258,12 +314,15 @@ def trainer_export_dataset(max_images=0):
         progress=100,
         current=total,
         total=total,
-        message=f"Done: {exported} new, {existing} reused, {skipped} skipped",
-        result={"ok": True, "exported": exported, "existing": existing, "skipped": skipped})
+        message=f"Done: {exported} new, {existing} reused, {skipped} skipped"
+                + (f", {dupes_removed} dupes + {orphans_removed} orphans cleaned" if (dupes_removed or orphans_removed) else ""),
+        result={"ok": True, "exported": exported, "existing": existing, "skipped": skipped,
+                "dupes_removed": dupes_removed, "orphans_removed": orphans_removed})
 
     _log(f"EXPORT: COMPLETED — {exported} new, {existing} reused, {skipped} skipped")
 
-    return {"ok": True, "exported": exported, "existing": existing, "skipped": skipped}
+    return {"ok": True, "exported": exported, "existing": existing, "skipped": skipped,
+            "dupes_removed": dupes_removed, "orphans_removed": orphans_removed}
 
 
 def trainer_reannotate(teacher_path, confidence, allowed_classes, merge=False):
@@ -563,23 +622,21 @@ def trainer_dedup_phash(hamming_threshold, dry_run=False):
         total_kept += len(kept_hashes)
         _ss_set("dedup", message=f"pHash: {camera} — {removed} removed, {len(kept_hashes)} kept")
 
-    # Phase 2: redistribute kept images 90/10 train/val
+    # Phase 2: settle split membership using the stable per-event rule.
+    # Deterministic: an image only moves if its current split disagrees with
+    # assign_split(event_id), so re-running dedup moves nothing.
     if not dry_run and kept_all:
-        _ss_set("dedup", message=f"pHash: redistributing {len(kept_all)} images 90/10...", progress=80)
-        _log(f"DEDUP pHASH: redistributing {len(kept_all)} images 90/10...")
+        _ss_set("dedup", message=f"pHash: settling split membership for {len(kept_all)} images...", progress=80)
+        _log(f"DEDUP pHASH: settling split membership for {len(kept_all)} images...")
 
-        random.shuffle(kept_all)
-        val_count = max(1, round(len(kept_all) * 0.1))
-        train_count = len(kept_all) - val_count
         moved = 0
-
-        for idx, (img_path, label_path, current_split) in enumerate(kept_all):
-            target_split = "val" if idx < val_count else "train"
+        for (img_path, label_path, current_split) in kept_all:
+            event_id = Path(img_path).stem
+            target_split = assign_split(event_id)
             if target_split == current_split:
                 continue
 
             # Move image
-            event_id = Path(img_path).stem
             ext = Path(img_path).suffix
             target_img_dir = os.path.join(STATE["DATASET_DIR"], "images", target_split)
             target_lbl_dir = os.path.join(STATE["DATASET_DIR"], "labels", target_split)
@@ -594,8 +651,32 @@ def trainer_dedup_phash(hamming_threshold, dry_run=False):
                 shutil.move(label_path, target_lbl)
             moved += 1
 
-        _log(f"DEDUP pHASH: redistributed — {moved} moved, {train_count} train / {val_count} val")
-        _ss_set("dedup", message=f"pHash: done — {total_removed} removed, {moved} redistributed ({train_count}T/{val_count}V)", progress=100)
+        # Guarantee at least 1 val image (YOLO requires it). Deterministic pick:
+        # the train image whose event id is closest to the val band of the crc rule.
+        val_dir = os.path.join(STATE["DATASET_DIR"], "images", "val")
+        val_now = len(_glob_images(val_dir)) if os.path.exists(val_dir) else 0
+        if val_now == 0:
+            candidates = [
+                (abs(zlib.crc32(Path(p).stem.encode()) % 100 - VAL_SPLIT_PERCENT // 2), Path(p).stem, p, l, s)
+                for (p, l, s) in kept_all if s == "train"
+            ]
+            candidates.sort()
+            if candidates:
+                _, stem, img_path, label_path, _ = candidates[0]
+                os.makedirs(val_dir, exist_ok=True)
+                target_lbl_dir = os.path.join(STATE["DATASET_DIR"], "labels", "val")
+                os.makedirs(target_lbl_dir, exist_ok=True)
+                ext = Path(img_path).suffix
+                shutil.move(img_path, os.path.join(val_dir, f"{stem}{ext}"))
+                if os.path.exists(label_path):
+                    shutil.move(label_path, os.path.join(target_lbl_dir, f"{stem}.txt"))
+                moved += 1
+                _log(f"DEDUP pHASH: val was empty — moved {stem} to val (deterministic pick)")
+
+        train_now = len(_glob_images(os.path.join(STATE["DATASET_DIR"], "images", "train")))
+        val_now = len(_glob_images(val_dir)) if os.path.exists(val_dir) else 0
+        _log(f"DEDUP pHASH: settled — {moved} moved, {train_now} train / {val_now} val")
+        _ss_set("dedup", message=f"pHash: done — {total_removed} removed, {moved} settled ({train_now}T/{val_now}V)", progress=100)
 
     _log(f"DEDUP pHASH: COMPLETED — {total_removed} removed, {total_kept} kept")
     return {"ok": True, "removed": total_removed, "kept": total_kept}
@@ -708,10 +789,16 @@ def trainer_train(model_path, epochs, batch_size, lr, lr_final, imgsz, freeze, a
         train_images = _glob_images(os.path.join(STATE["DATASET_DIR"], "images", "train"))
         if not train_images:
             return {"ok": False, "error": "No images in dataset"}
-        # Move 10% (min 1) from train to val
+        # Move up to 10% (min 1) from train to val — deterministic: prefer
+        # images whose event id maps to val under the stable split rule, fall
+        # back to the first images by name so repeated runs pick the same set.
+        train_images = sorted(train_images)
         n = max(1, len(train_images) // 10)
-        import random as _rnd
-        for img in _rnd.sample(train_images, min(n, len(train_images))):
+        picks = [img for img in train_images if assign_split(Path(img).stem) == "val"]
+        if not picks:
+            picks = train_images
+        moved_names = []
+        for img in picks[:min(n, len(train_images))]:
             name = os.path.basename(img)
             stem = os.path.splitext(name)[0]
             shutil.move(img, os.path.join(val_img_dir, name))
@@ -719,7 +806,8 @@ def trainer_train(model_path, epochs, batch_size, lr, lr_final, imgsz, freeze, a
             dst_lbl = os.path.join(STATE["DATASET_DIR"], "labels", "val", stem + ".txt")
             if os.path.exists(src_lbl):
                 shutil.move(src_lbl, dst_lbl)
-        _log(f"TRAIN: Val was empty — moved {n} images from train to val")
+            moved_names.append(stem)
+        _log(f"TRAIN: Val was empty — moved {len(moved_names)} images from train to val: {', '.join(moved_names)}")
 
     output_dir = os.path.join(os.path.dirname(STATE["DATASET_DIR"]), "output")
     models_dir = conf("MODELS_DIR")
